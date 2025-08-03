@@ -785,11 +785,16 @@ class TorchDisk:
         if os.path.exists(tensor.data) and tensor.delete_file:
             os.remove(tensor.data)
 
-    def init_cache_one_gpu_batch(self, config, task, policy):
+    def init_cache_one_gpu_batch(self, config, task, policy, hh_k=None, hh_all=False):
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.n_head, config.input_dim, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
+        if hh_all:
+            shape = (hh_k * 2, gpu_batch_size * num_head, hidden_size // num_head)
+        elif hh_k * 2 < prompt_len:
+            shape = (hh_k * 2 + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
+        else:
+            shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
         k_cache = self.allocate(shape, np.float16)
         v_cache = self.allocate(shape, np.float16)
         acc = self.allocate(shape[:-1], np.float16)
@@ -966,10 +971,29 @@ def cache_replace(dst: TorchTensor, dst_indices, src: torch.Tensor, hh_k, oldest
     #return
 
     # least_recent[0, :, :] = dst.data[oldest][:, :]
-    least_recent = torch.tensor(dst.data[oldest]).unsqueeze(0).to(dst.data.device)
-    indices = dst_indices.view(-1, 1).expand(-1, dst.shape[2]).unsqueeze(0).to(dst.data.device)
-    dst.data.scatter_(0, indices, least_recent)
-    dst.data[oldest] = src.data.squeeze()
+    if type(dst.data) == torch.Tensor:
+        least_recent = dst.data[oldest].clone().unsqueeze(0).to(dst.data.device)
+        indices = dst_indices.view(-1, 1).expand(-1, dst.shape[2]).unsqueeze(0).to(dst.data.device)
+        dst.data.scatter_(0, indices, least_recent)
+        dst.data[oldest] = src.data.squeeze()
+    else:
+        # print(dst_indices.tolist())
+        # exit()
+        for head_col, evict_row in enumerate(dst_indices.tolist()):
+            src_slice = (slice(oldest, oldest+1),
+                         slice(head_col, head_col+1),
+                         slice(None))
+            dst_slice = (slice(evict_row, evict_row+1),
+                         slice(head_col, head_col+1),
+                         slice(None))
+            general_copy(dst, dst_slice, dst, src_slice)
+        dst.device.synchronize() # assumes dst.device is a disk, make this more explicit
+        general_copy(dst,
+                     (slice(oldest, oldest+1),
+                      slice(None),
+                      slice(None)),
+                     src,
+                     None)
 
 
 def acc_replace(dst, dst_indices, src, hh_k, oldest):
@@ -987,12 +1011,27 @@ def acc_replace(dst, dst_indices, src, hh_k, oldest):
     # return
  
     if abs(oldest) >= min(dst.shape[0], hh_k * 2): return
-    dst.data = src.data
     oldest = hh_k * 2 - 1 + oldest
-    least_recent = torch.tensor(src.data[oldest]).unsqueeze(0).to(dst.data.device)
-    indices = dst_indices.unsqueeze(0).to(dst.data.device)
-    dst.data.scatter_(0, indices, least_recent)
-    dst.data[oldest] = src.data[-1]
+
+    if type(dst.data) == torch.Tensor:
+        dst.data = src.data
+        least_recent = src.data[oldest].clone().unsqueeze(0).to(dst.data.device)
+        indices = dst_indices.unsqueeze(0).to(dst.data.device)
+        dst.data.scatter_(0, indices, least_recent)
+        dst.data[oldest] = src.data[-1]
+    else:
+        for head_col, evict_row in enumerate(dst_indices.tolist()):
+            src_slice = (slice(oldest, oldest+1),
+                         slice(head_col, head_col+1))
+            dst_slice = (slice(evict_row, evict_row+1),
+                         slice(head_col, head_col+1))
+            general_copy(dst, dst_slice, dst, src_slice)
+        dst.device.synchronize() # assumes dst.device is a disk, make this more explicit
+        general_copy(dst,
+                     (slice(oldest, oldest+1), slice(None)),
+                     src,
+                     (slice(-1, None), slice(None))) 
+    
 
 
 def general_copy(dst: TorchTensor, dst_indices: Tuple[slice],

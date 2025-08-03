@@ -272,11 +272,10 @@ def print_cpu_mem_usage(message = None):
     return vir_mem
 
 
-def write_benchmark_log(filename, model_size, cache_size, hidden_size,
+def get_log_string(model_size, cache_size, hidden_size,
         gpu_peak_mem, projected, prefill_latency, prefill_throughput,
         decode_latency, decode_throughput, total_latency, total_throughput):
-
-    log_str = (f"model size: {model_size/GB:.3f} GB\t"
+    return (f"model size: {model_size/GB:.3f} GB\t"
                f"cache size: {cache_size/GB:.3f} GB\t"
                f"hidden size (p): {hidden_size/GB:.3f} GB\n"
                f"peak gpu mem: {gpu_peak_mem / GB:.3f} GB\t"
@@ -287,10 +286,6 @@ def write_benchmark_log(filename, model_size, cache_size, hidden_size,
                f"decode throughput: {decode_throughput:.3f} token/s\n"
                f"total latency: {total_latency:.3f} s\t"
                f"total throughput: {total_throughput:.3f} token/s")
-    with open(filename, "a") as fout:
-        fout.write(log_str + "\n")
-
-    return log_str
 
 
 def read_benchmark_log(filename):

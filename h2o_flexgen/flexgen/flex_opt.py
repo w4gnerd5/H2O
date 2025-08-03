@@ -10,6 +10,7 @@ import pickle
 import time
 from typing import Union, List, Optional
 import psutil
+from dotenv import load_dotenv
 
 import numpy as np
 from tqdm import tqdm
@@ -25,7 +26,7 @@ from flexgen.timer import timers
 from flexgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     array_1d, array_2d, array_3d, str2bool, project_decode_latency,
     torch_mem_stats, torch_dtype_to_np_dtype, print_cpu_mem_usage,
-    write_benchmark_log, read_benchmark_log)
+    get_log_string, read_benchmark_log)
 
 fix_recursive_import()
 
@@ -978,10 +979,17 @@ class OptLM:
                     self.load_weight(i, j, k, overlap=False)
 
                 for k in range(self.num_gpu_batches):
+                    # extra sync calls are needed to satisfy general_copy() requirements (which all functions call)
+                    # also prevents OOM Error by immediately deleting weights of this layer from GPU (if weight_home != GPU)
+                    self.sync()
                     self.load_cache(i, j, k, overlap=False)
+                    self.sync()
                     self.load_hidden(i, j, k)
+                    self.sync()
                     self.compute_layer(i, j, k)
+                    self.sync()
                     self.store_hidden(i, j, k)
+                    self.sync()
                     self.store_cache(i, j, k, overlap=False)
             timers("generate").stop()
 
@@ -1252,9 +1260,9 @@ def get_filename(args):
 
 
 def get_test_inputs(prompt_len, num_prompts, tokenizer):
-    # prompts = ["Paris is the capital city of"]
-    prompts = ["Artificial Intelligence (AI) refers to the development of computer systems or machines that can perform tasks that typically require human intelligence. These tasks include problem-solving, learning, understanding natural language, recognizing patterns, perception, and decision-making. AI systems are designed to process vast amounts of data and draw conclusions or make decisions based on that data. There are two main categories of AI: Narrow AI and General AI. Narrow AI, also known as Weak AI, is designed for "]
-    prompts = ["As I sit here on my porch, sipping my coffee and watching the world go by, I can not help but feel a sense of wonder at the sheer complexity of everything around us. From the smallest particle to the grandest galaxy, the universe is a tapestry of infinite detail and beauty. And yet, for all its complexity, there is a simplicity to it all that is truly awe-inspiring. Everything is connected, in ways that we can not even begin to fathom. Every action has a reaction, every cause has an effect. And yet, even with all the knowledge that we have amassed, there is still so much that we do not understand. There are mysteries that have eluded us for centuries, and may continue to do so for centuries to come. But that does not stop us from trying to unravel them. It does not stop us from exploring the depths of our own consciousness, or the vast expanse of the cosmos. It does not stop us from seeking answers to the biggest questions of all. Who are we? Why are we here? What is the meaning of life? These are questions that have plagued us since the dawn of time, and yet we continue to search for answers. Perhaps it is in the search itself that we find meaning. Perhaps it is in the journey, rather than the destination, that we discover the true nature of our existence. And so, as I sit here on my porch, watching the world go by, I am content to simply marvel at the beauty and complexity of it all, and to embrace the mystery that lies at the heart of our being."]
+    prompts = ["Paris is the capital city of"]
+    # prompts = ["Artificial Intelligence (AI) refers to the development of computer systems or machines that can perform tasks that typically require human intelligence. These tasks include problem-solving, learning, understanding natural language, recognizing patterns, perception, and decision-making. AI systems are designed to process vast amounts of data and draw conclusions or make decisions based on that data. There are two main categories of AI: Narrow AI and General AI. Narrow AI, also known as Weak AI, is designed for "]
+    # prompts = ["As I sit here on my porch, sipping my coffee and watching the world go by, I can not help but feel a sense of wonder at the sheer complexity of everything around us. From the smallest particle to the grandest galaxy, the universe is a tapestry of infinite detail and beauty. And yet, for all its complexity, there is a simplicity to it all that is truly awe-inspiring. Everything is connected, in ways that we can not even begin to fathom. Every action has a reaction, every cause has an effect. And yet, even with all the knowledge that we have amassed, there is still so much that we do not understand. There are mysteries that have eluded us for centuries, and may continue to do so for centuries to come. But that does not stop us from trying to unravel them. It does not stop us from exploring the depths of our own consciousness, or the vast expanse of the cosmos. It does not stop us from seeking answers to the biggest questions of all. Who are we? Why are we here? What is the meaning of life? These are questions that have plagued us since the dawn of time, and yet we continue to search for answers. Perhaps it is in the search itself that we find meaning. Perhaps it is in the journey, rather than the destination, that we discover the true nature of our existence. And so, as I sit here on my porch, watching the world go by, I am content to simply marvel at the beauty and complexity of it all, and to embrace the mystery that lies at the heart of our being."]
     input_ids = tokenizer(prompts, padding="max_length",
                           max_length=prompt_len, add_special_tokens=False).input_ids
     # input_ids = tokenizer(prompts, add_special_tokens=False).input_ids
@@ -1272,8 +1280,6 @@ def run_flexgen(args):
     # Task and policy
     warmup_inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
     inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
-    prompt_len = len(inputs[0])
-    print(prompt_len)
 
     gpu = TorchDevice("cuda:0")
     cpu = TorchDevice("cpu")
@@ -1354,10 +1360,14 @@ def run_flexgen(args):
     else:
         filename = args.log_file
 
-    log_str = write_benchmark_log(filename,
-        opt_config.model_bytes(), cache_size, hidden_size,
-        gpu_peak_mem, projected, prefill_latency, prefill_throughput,
-        decode_latency, decode_throughput, total_latency, total_throughput)
+    log_str = get_log_string(opt_config.model_bytes(), cache_size, hidden_size,
+            gpu_peak_mem, projected, prefill_latency, prefill_throughput,
+            decode_latency, decode_throughput, total_latency, total_throughput)
+    
+    if not args.no_log:
+        with open(filename, "a") as fout:
+            fout.write(log_str + "\n")
+
     if args.verbose >= 1:
         print(log_str)
 
@@ -1413,6 +1423,7 @@ def add_parser_arguments(parser):
 
 
 if __name__ == "__main__":
+    load_dotenv()
     parser = argparse.ArgumentParser()
     add_parser_arguments(parser)
     args = parser.parse_args()
