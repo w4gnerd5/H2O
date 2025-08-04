@@ -889,7 +889,9 @@ class TorchMixedDevice:
             seg_lengths=lens, pin_memory=pin_memory)
         v_cache = self.allocate(shape, np.float16,
             seg_lengths=lens, pin_memory=pin_memory)
-        return k_cache, v_cache
+        acc = self.allocate(shape[:-1], np.float16,
+            seg_lengths=lens, pin_memory=pin_memory)
+        return k_cache, v_cache, acc
 
 
 class TorchLink:
@@ -950,8 +952,6 @@ def cache_replace(dst: TorchTensor, dst_indices, src: TorchTensor, hh_k, oldest)
     # dst_indices: (h)
     # src: (1, b * n_head, head_dim)
     if abs(oldest) >= min(dst.shape[0], hh_k * 2): return
-    oldest = hh_k * 2 - 1 + oldest
-
     #dst_cupy = cp.asarray(dst.data)
     #ind_cupy = cp.asarray(dst_indices)
     #src_cupy = cp.asarray(src.data)
@@ -973,6 +973,7 @@ def cache_replace(dst: TorchTensor, dst_indices, src: TorchTensor, hh_k, oldest)
     assert type(src.data) == torch.Tensor
 
     if dst.device.device_type == DeviceType.DISK:
+        oldest = hh_k * 2 - 1 + oldest
         arr = np.lib.format.open_memmap(dst.data)
         old_row = arr[oldest]
         rows = dst_indices.cpu().numpy()
@@ -980,12 +981,24 @@ def cache_replace(dst: TorchTensor, dst_indices, src: TorchTensor, hh_k, oldest)
         new_row = src.data.cpu().numpy().squeeze(0) 
         arr[oldest, :, :] = new_row
         arr.flush()
-        return
-
-    least_recent = dst.data[oldest].clone().unsqueeze(0).to(dst.data.device)
-    indices = dst_indices.view(-1, 1).expand(-1, dst.shape[2]).unsqueeze(0).to(dst.data.device)
-    dst.data.scatter_(0, indices, least_recent)
-    dst.data[oldest] = src.data.squeeze()
+    elif dst.device.device_type == DeviceType.MIXED:
+        segments, seg_points = dst.data
+        for idx, sub_dst in enumerate(segments):
+            if sub_dst is None:
+                continue
+            start, end = seg_points[idx], seg_points[idx+1]
+            sub_src_data = src.data[:, start:end, :]
+            sub_src = TorchTensor.create_from_torch(
+                data=sub_src_data,
+                device=src.device
+            )
+            cache_replace(sub_dst, dst_indices, sub_src, hh_k, oldest)
+    else:
+        oldest = hh_k * 2 - 1 + oldest
+        least_recent = dst.data[oldest].clone().unsqueeze(0).to(dst.data.device)
+        indices = dst_indices.view(-1, 1).expand(-1, dst.shape[2]).unsqueeze(0).to(dst.data.device)
+        dst.data.scatter_(0, indices, least_recent)
+        dst.data[oldest] = src.data.squeeze()
 
 
 def acc_replace(dst: TorchTensor, dst_indices, src: TorchTensor, hh_k, oldest):
@@ -1003,11 +1016,11 @@ def acc_replace(dst: TorchTensor, dst_indices, src: TorchTensor, hh_k, oldest):
     # return
  
     if abs(oldest) >= min(dst.shape[0], hh_k * 2): return
-    oldest = hh_k * 2 - 1 + oldest
 
     assert type(src.data) == torch.Tensor
 
     if dst.device.device_type == DeviceType.DISK:
+        oldest = hh_k * 2 - 1 + oldest
         arr = np.lib.format.open_memmap(dst.data)
         new_acc = src.data.cpu().numpy()
         arr[:] = new_acc
@@ -1015,14 +1028,25 @@ def acc_replace(dst: TorchTensor, dst_indices, src: TorchTensor, hh_k, oldest):
         arr[rows, :] = arr[oldest]
         arr[oldest, :] = new_acc[-1]
         arr.flush()
-        return
-
-    dst.data = src.data
-    least_recent = src.data[oldest].clone().unsqueeze(0).to(dst.data.device)
-    indices = dst_indices.unsqueeze(0).to(dst.data.device)
-    dst.data.scatter_(0, indices, least_recent)
-    dst.data[oldest] = src.data[-1]
-    
+    elif dst.device.device_type == DeviceType.MIXED:
+        segments, seg_points = dst.data
+        for idx, sub_dst in enumerate(segments):
+            if sub_dst is None:
+                continue
+            start, end = seg_points[idx], seg_points[idx+1]
+            sub_src_data = src.data[:, start:end]
+            sub_src = TorchTensor.create_from_torch(
+                data=sub_src_data,
+                device=src.device
+            )
+            acc_replace(sub_dst, dst_indices, sub_src, hh_k, oldest)
+    else:
+        oldest = hh_k * 2 - 1 + oldest
+        dst.data.copy_(src.data)
+        least_recent = src.data[oldest].clone().unsqueeze(0).to(dst.data.device)
+        indices = dst_indices.unsqueeze(0).to(dst.data.device)
+        dst.data.scatter_(0, indices, least_recent)
+        dst.data[oldest] = src.data[-1]
 
 
 def general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
